@@ -1,0 +1,53 @@
+{
+  "name": "pws-practical-management-system",
+  "private": true,
+  "version": "1.0.0",
+  "overrides": {
+    "uuid": "^11.1.1"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "file-saver": "^2.0.5",
+    "firebase": "^12.18.0",
+    "firebase-admin": "^14.3.0",
+    "fs-extra": "^11.3.2",
+    "googleapis": "^173.0.0",
+    "helmet": "^8.3.0",
+    "jspdf": "^4.2.1",
+    "jszip": "^3.10.1",
+    "lucide-react": "^0.564.0",
+    "multer": "^2.0.2",
+    "nodemailer": "^9.0.0",
+    "papaparse": "^5.5.3",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^7.18.2",
+    "resend": "^6.17.2",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.4.16",
+    "postcss": "^8.4.32",
+    "tailwindcss": "^3.3.6",
+    "vite": "^8.2.2"
+  },
+  "description": "A secure, hybrid-web application to automate university practical examinations built with React (Vite) and Firebase.",
+  "main": "server.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

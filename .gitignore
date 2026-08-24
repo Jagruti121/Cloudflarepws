@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+database.db
+serviceAccountKey.json
+sa.json
+*.txt
+node_modules/
+dist/
+build/
+.DS_Store

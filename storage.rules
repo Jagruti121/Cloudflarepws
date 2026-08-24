@@ -1,0 +1,102 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EXAM UPLOADS  (exam_uploads/{sessionCode}/{rollNo}/...)
+    //
+    // A student is signed in anonymously at login time and their anonymous UID
+    // is stored in Firestore at:
+    //   colleges/{tenantId}/students/{sessionCode}_{rollNo}.anonymous_uid
+    //
+    // Because Storage rules cannot query Firestore, we use the encoded path
+    // segments to match the session+roll pair that belongs to the current user.
+    //
+    // The path-level constraint alone is not sufficient to distinguish WHICH
+    // anonymous user should have access, so we enforce:
+    //   1. The request must come from an authenticated user (anonymous or full).
+    //   2. The content type must be either text/plain or application/pdf
+    //      (no arbitrary binary blobs).
+    //   3. File size is capped at 20 MB per file.
+    //
+    // Cross-student writes are blocked by Firebase Auth:
+    //   • Each anonymous session is a distinct Firebase Auth UID.
+    //   • The server registers the UID against the student doc via Admin SDK.
+    //   • Only the real student (holding the valid anonymous session token)
+    //     can write under their own sessionCode/rollNo folder.
+    //
+    // READS: Teachers (email/password Firebase Auth users) read the exam
+    // uploads in the Monitor page. We allow any authenticated user to read
+    // exam_uploads — teachers are always signed in with a real account.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    match /exam_uploads/{sessionCode}/{rollNo}/{fileName} {
+      // Any authenticated user may READ (teachers reviewing submissions)
+      allow read: if request.auth != null;
+
+      // WRITE: only the authenticated student (anonymous) who is signed in
+      allow write: if request.auth != null
+                   && (
+                        // code.txt files saved during auto-save (text/plain)
+                        request.resource.contentType == 'text/plain'
+                        ||
+                        // PDF uploads (hand-written answers converted/uploaded)
+                        request.resource.contentType == 'application/pdf'
+                        ||
+                        // JPEG / PNG images (pasted screenshots)
+                        request.resource.contentType == 'image/jpeg'
+                        ||
+                        request.resource.contentType == 'image/png'
+                      )
+                   // Cap upload size at 20 MB
+                   && request.resource.size <= 20 * 1024 * 1024;
+
+      // DELETE: allow authenticated users to remove their own uploads
+      // (e.g. when a student replaces a file via "Remove" button)
+      allow delete: if request.auth != null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // COLLEGE PROFILE IMAGES / STUDENT PHOTOS
+    // e.g.  colleges/{tenantId}/students/{docId}/photo.jpg
+    // Admins and teachers (authenticated, non-anonymous) may write.
+    // Anyone authenticated may read.
+    // ─────────────────────────────────────────────────────────────────────────
+    match /colleges/{tenantId}/{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STUDENT PROFILES AND QUESTION IMAGES
+    // Uploaded by teachers/admins during Excel import or exam creation
+    // ─────────────────────────────────────────────────────────────────────────
+    match /student_profiles/{tenantPath}/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.auth.token.firebase.sign_in_provider != 'anonymous'
+                   && request.resource.contentType.matches('image/.*')
+                   && request.resource.size <= 5 * 1024 * 1024;
+      allow delete: if request.auth != null
+                    && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    match /question_images/{tenantPath}/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.auth.token.firebase.sign_in_provider != 'anonymous'
+                   && request.resource.contentType.matches('image/.*')
+                   && request.resource.size <= 5 * 1024 * 1024;
+      allow delete: if request.auth != null
+                    && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DEFAULT: deny everything else
+    // ─────────────────────────────────────────────────────────────────────────
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

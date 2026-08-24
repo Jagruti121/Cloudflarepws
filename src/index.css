@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* ── Modal entrance animation ── */
+@keyframes modalScaleIn {
+  0% { opacity: 0; transform: scale(0.85) translateY(12px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+.animate-modal-in {
+  animation: modalScaleIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ── Modal backdrop fade ── */
+@keyframes backdropFadeIn {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+.animate-backdrop-in {
+  animation: backdropFadeIn 0.2s ease-out forwards;
+}
+
+/* ── Upload progress bar shimmer ── */
+@keyframes progressShimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.progress-bar-shimmer {
+  background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.3) 50%, rgba(255,255,255,0) 100%);
+  background-size: 200% 100%;
+  animation: progressShimmer 1.5s ease-in-out infinite;
+}
+
+/* ── Auto-save pulse indicator ── */
+@keyframes savePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.animate-save-pulse {
+  animation: savePulse 1s ease-in-out infinite;
+}
+
+/* ── Progress bar fill transition ── */
+.progress-bar-fill {
+  transition: width 0.3s ease-out;
+}
+

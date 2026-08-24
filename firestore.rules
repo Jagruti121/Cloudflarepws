@@ -1,0 +1,336 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // HELPER FUNCTIONS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Returns true if the caller is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Returns true if the caller is registered as a college admin
+    function isCollegeAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+
+    // Returns true if the caller is a Super Admin / Founder
+    function isSuperAdmin() {
+      return isAuthenticated() && request.auth.token.super_admin == true;
+    }
+
+    // Returns true if the caller's tenantId matches the requested tenant scope
+    function isOwnTenant(tenantId) {
+      return isCollegeAdmin() && request.auth.token.tenantId == tenantId;
+    }
+
+    // Returns true if caller is a teacher belonging to the given tenant
+    function isOwnTenantTeacher(tenantId) {
+      return isAuthenticated() && request.auth.token.teacher == true && request.auth.token.tenantId == tenantId;
+    }
+
+    // Returns true if the caller has teacher access — either a direct teacher claim
+    // OR an admin claim (admins have full teacher-level access by design).
+    // Use this for teacher_users collection reads so dual-role admin+teacher users
+    // are not blocked by a stale token during the brief login claims-sync window.
+    function hasTeacherAccess() {
+      return isAuthenticated() && (
+        request.auth.token.teacher == true ||
+        request.auth.token.admin == true
+      );
+    }
+
+    // ── SECURITY FIX K-1: Subscription expiry check in Firestore rules ──
+    // Returns true if the college's subscription is still active.
+    // This is enforced server-side and cannot be bypassed by client-side Date manipulation.
+    function isSubscriptionActive(tenantId) {
+      let settings = get(/databases/$(database)/documents/colleges/$(tenantId)/config/settings).data;
+      return settings.subscriptionExpiry > request.time;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // KEY DATABASE (/product_keys)
+    //   • Super Admins: Full R/W (to create new keys)
+    //   • College Admins during activation: Read + Update ONLY if key is NOT yet activated
+    //   • After activation: Access is DISCONNECTED (College Admins cannot read/write)
+    //
+    // SECURITY FIX B-2: The activation update is constrained to only flip
+    // isActivated and set activatedAt — no other fields can be changed.
+    // Combined with a client-side runTransaction, this prevents race conditions.
+    // ─────────────────────────────────────────────────────────────────────────
+    match /product_keys/{keyId} {
+      // Super Admin can do anything
+      allow read, write: if isSuperAdmin();
+
+      // During First-Time Activation: allow reading an unactivated key WITHOUT auth
+      // (activation page has no logged-in user at step 1)
+      allow read: if resource.data.isActivated == false;
+
+      // After Activation: allow reading if the user is the registered admin or faculty
+      allow read: if isAuthenticated() && (
+                     request.auth.token.email == resource.data.adminEmail ||
+                     request.auth.token.email in resource.data.get('facultyEmails', [])
+                  );
+
+      // ── SECURITY FIX B-2 ──
+      // Allow any authenticated user to ONLY flip isActivated to true (one-time burn).
+      allow update: if isAuthenticated()
+                    && resource.data.isActivated == false
+                    && request.resource.data.isActivated == true
+                    && request.resource.data.tenantId == resource.data.tenantId
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['isActivated', 'activatedAt']);
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ADMIN USERS MAPPING (/admin_users/{uid})
+    //   • Super Admins: Full R/W
+    //   • College Admins: Read their OWN document ONLY
+    //   • Write during activation is allowed (creating the mapping document)
+    // ─────────────────────────────────────────────────────────────────────────
+    match /admin_users/{uid} {
+      allow read, write: if isSuperAdmin();
+
+      // A user can read only their own mapping document
+      allow read: if isAuthenticated() && request.auth.uid == uid;
+
+      // Allow creating own admin_users doc during activation (first write)
+      allow create: if isAuthenticated() && request.auth.uid == uid
+                    && request.resource.data.role == 'admin';
+
+      // Allow updating own admin_users doc (used for legalConsent)
+      allow update: if isAuthenticated() && request.auth.uid == uid;
+    }
+
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // SUPER ADMINS BOOTSTRAP (/super_admins/{uid})
+    //   Normally only isSuperAdmin() can access this, but we need to allow
+    //   an authenticated user to CREATE their own doc the very first time
+    //   (one-time bootstrap via /setup page). After bootstrap, this self-create
+    //   rule should be removed.
+    // ───────────────────────────────────────────────────────────────────────────
+    match /super_admins/{uid} {
+      allow read, write: if isSuperAdmin();
+      allow read: if isAuthenticated() && request.auth.uid == uid;
+      // Allow first-time bootstrap: an authenticated user can create their own super_admin doc
+      allow create: if isAuthenticated() && request.auth.uid == uid;
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TEACHER USERS LOOKUP (/teacher_users/{uid})
+    //   • Root-level lookup table for teacher → tenant resolution during login.
+    //   • Created by College Admin when provisioning a teacher.
+    //   • Teachers can read their own doc (for tenantId resolution).
+    // ─────────────────────────────────────────────────────────────────────────
+    match /teacher_users/{uid} {
+      allow read, write: if isSuperAdmin();
+
+      // Teacher or admin can read their own doc.
+      // This covers the dual-role login window where an admin+teacher user
+      // reads their teacher_users doc before the refreshed token (teacher:true)
+      // has propagated — preventing a FirebaseError race condition.
+      allow read: if isAuthenticated() && request.auth.uid == uid;
+
+      // Teacher can write to their own doc (used for legalConsent)
+      allow write: if isAuthenticated() && request.auth.uid == uid;
+
+      // College Admin can create/delete teacher_users docs (provisioning)
+      allow create, delete: if isCollegeAdmin();
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EXAM INDEX (/exam_index/{sessionCode})
+    //   • Root-level lookup table for session → tenant resolution during student login.
+    //   • Created by Teacher when launching an exam.
+    //   • Students (unauthenticated) need read access — allow any read.
+    //
+    // SECURITY FIX B-3: Create/delete is now scoped so a teacher can ONLY create
+    // exam_index entries whose tenantId matches their own tenant.
+    // This prevents a teacher from College A poisoning sessions for College B.
+    // ─────────────────────────────────────────────────────────────────────────
+    match /exam_index/{sessionCode} {
+      allow read, write: if isSuperAdmin();
+
+      // Any user can read (students are unauthenticated for this lookup)
+      allow read: if true;
+
+      // ── SECURITY FIX B-3 ──
+      // Teacher can only create an entry whose tenantId matches their own tenant.
+      allow create: if isAuthenticated()
+                    && isOwnTenantTeacher(request.resource.data.tenantId);
+
+      // Teacher can only delete entries belonging to their own tenant
+      allow delete: if isAuthenticated()
+                    && isOwnTenantTeacher(resource.data.tenantId);
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SUPER ADMINS REGISTRY (/super_admins/{uid})
+    //   • Only Super Admins can read/write this collection (bootstrapped manually)
+    // ─────────────────────────────────────────────────────────────────────────
+    match /super_admins/{uid} {
+      allow read, write: if isSuperAdmin();
+      allow read: if isAuthenticated() && request.auth.uid == uid;
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MASTER TENANT DATABASE (/colleges/{tenantId}/...)
+    //   • Each College Admin has R/W access to ONLY their own tenant subtree.
+    //   • Each Teacher has R/W access to ONLY their own tenant subtree.
+    //   • Cross-tenant access is DENIED.
+    //   • Super Admins retain full R/W for support.
+    //
+    // SECURITY FIX B-1 (CRITICAL): The previous rule had `allow read, write: if true`
+    // for students, which granted ANY unauthenticated user full read/write access to
+    // the entire tenant subtree — including other colleges' data.
+    //
+    // NEW APPROACH:
+    //   Students are NOT Firebase Auth users. They access data via URL parameters
+    //   (tenantId, sessionCode, rollNo) validated at StudentLogin.jsx.
+    //   The Firestore rule now scopes student reads to the correct session and
+    //   student writes to ONLY their own student document.
+    //
+    // SECURITY FIX K-1: College Admin and Teacher writes are now gated on an active
+    // subscription check, enforced server-side in these rules.
+    // ─────────────────────────────────────────────────────────────────────────
+    match /colleges/{tenantId}/{document=**} {
+      // Super Admin full access (for support and maintenance)
+      allow read, write: if isSuperAdmin();
+
+      // College Admin: R/W own tenant ONLY + subscription must be active for writes
+      allow read: if isOwnTenant(tenantId);
+      allow write: if isOwnTenant(tenantId) && isSubscriptionActive(tenantId);
+
+      // Teacher: R/W own tenant ONLY + subscription must be active for writes
+      allow read: if isOwnTenantTeacher(tenantId);
+      allow write: if isOwnTenantTeacher(tenantId) && isSubscriptionActive(tenantId);
+    }
+
+    // ── SECURITY FIX B-1: Scoped student access rules ──
+    // Students get targeted access to ONLY the collections they need:
+    // 1. They can read the exam config document for their session
+    // 2. They can read and write ONLY their own student document
+    // 3. They can read college settings (for college name display)
+    // Cross-tenant access remains impossible as tenantId comes from exam_index lookup.
+
+    // Student: read exam config for their session
+    // SECURITY FIX MED-06: Restricted to authenticated users to protect sensitive exam metadata.
+    match /colleges/{tenantId}/exams/{sessionCode} {
+      allow read: if isAuthenticated();
+    }
+
+    // Student: read/write ONLY their own student record
+    // Document ID is "{sessionCode}_{rollNo}" — must match URL parameters
+    match /colleges/{tenantId}/students/{studentDocId} {
+      // SECURITY FIX MED-04: Remove allow read: if true (IDOR vulnerability).
+      // Previously, anyone with the public Firebase API key could dump ALL student
+      // records for any tenant via the Firestore REST API — no login required.
+      //
+      // Student identity is now verified server-side via /api/student/login,
+      // which uses the Admin SDK (bypasses these rules entirely) and returns
+      // a signed submitToken. Client-side reads of the student's own document
+      // are still needed for the real-time exam auto-save listener (onSnapshot),
+      // so we allow reads for teachers and admins of this tenant.
+      //
+      // The onSnapshot listener in ExamInterface.jsx works fine because:
+      //   - The anonymous Firebase Auth user satisfies isAuthenticated()
+      //   - The teacher-scoped read rule is satisfied by the teacher/admin who
+      //     launched the exam (they are still the primary reader)
+      //   - The student's anonymous auth token is NOT a teacher token, so they
+      //     cannot read other students. The onSnapshot on their own doc works
+      //     because the auto-save rules use the Admin SDK path on writes.
+      //
+      // STUDENT self-read (needed for onSnapshot in ExamInterface.jsx):
+      // We grant read if the anonymous user's Firebase UID matches the stored
+      // anonymous_uid logged at consent time. This is the correct minimal scope.
+      allow read: if isOwnTenant(tenantId) || isOwnTenantTeacher(tenantId) || isSuperAdmin()
+                  || (isAuthenticated() && resource.data.get('anonymous_uid', '') == request.auth.uid);
+
+      // SECURITY FIX CRIT-03: Constrained student write access —
+      // Only permit UPDATE (not create/delete) and only allow
+      // the fields that the exam interface legitimately writes. This stops
+      // fake record injection and record deletion while keeping the
+      // auto-save flow working for real students.
+      //
+      //   - CREATE is denied (only the backend Admin SDK creates student docs via teacher exam launch)
+      //   - DELETE is denied (only the backend Admin SDK can delete)
+      //   - UPDATE is allowed, but ONLY for the student-owned answer/status fields.
+      //     Score fields (scores.internal, scores.total, is_graded) can only be
+      //     written via the backend Admin SDK (which bypasses these rules entirely).
+
+      allow update: if
+        // Must be authenticated as the student who owns this record (or a teacher/admin)
+        (
+          (isAuthenticated() && resource.data.get('anonymous_uid', '') == request.auth.uid) ||
+          isOwnTenantTeacher(tenantId) ||
+          isOwnTenant(tenantId) ||
+          isSuperAdmin()
+        )
+        // The doc must already exist (no creation via this path)
+        && resource != null
+        // Scores and grading fields must NOT be modified by the client
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'scores', 'is_graded', 'name', 'rollNo', 'tenantId', 'session_code',
+          'assigned_questions', 'exam_type'
+        ]);
+
+      // CREATE and DELETE explicitly denied
+      allow create, delete: if false;
+    }
+
+
+    // ── SECURITY FIX MED-07 ──
+    // Removed "allow read: if true;" to prevent exposing faculty emails and subscription expiry.
+    // Only authenticated admins and teachers of this tenant (or super admins) can read this.
+    // The student exam UI gracefully handles the permission denied error if it tries to fetch the college name.
+    match /colleges/{tenantId}/config/settings {
+      allow read: if isOwnTenant(tenantId) || isOwnTenantTeacher(tenantId) || isSuperAdmin();
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // STUDENT CONSENT LOGS (/student_consent_logs/{sessionCode})
+    //
+    // One document per exam session (document ID = sessionCode).
+    // All student consents for that session are stored inside the document as a
+    // map under the key `students.{rollNo}` — so a single document holds every
+    // student's legalConsent record for the session.
+    //
+    // Written by anonymous students at final submission time.
+    // DPDP Act compliance:
+    //   • CREATE  — first student to submit for a session creates the document.
+    //   • UPDATE  — subsequent students merge their entry into the existing doc.
+    //   • DELETE  — not allowed (immutable audit trail).
+    //   • READ    — restricted to Super Admin for auditing only.
+    // ───────────────────────────────────────────────────────────────────────────
+    match /student_consent_logs/{sessionCode} {
+      // Super Admin can read all consent logs for auditing
+      allow read, write: if isSuperAdmin();
+
+      // Any authenticated user (including anonymous students) can CREATE
+      // the session document (first student to submit).
+      allow create: if request.auth != null;
+
+      // Any authenticated user can UPDATE the session document to merge in
+      // their own consent entry (subsequent students in the same session).
+      // No client can delete an existing consent log.
+      allow update: if request.auth != null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DENY ALL ELSE
+    // ─────────────────────────────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+  }
+}
