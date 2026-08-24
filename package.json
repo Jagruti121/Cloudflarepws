@@ -43,7 +43,7 @@
     "autoprefixer": "^10.4.16",
     "postcss": "^8.4.32",
     "tailwindcss": "^3.3.6",
-    "vite": "^8.2.2"
+    "vite": "^7.3.6"
   },
   "description": "A secure, hybrid-web application to automate university practical examinations built with React (Vite) and Firebase.",
   "main": "server.js",
