@@ -1038,7 +1038,7 @@ const SuperAdminDashboard = () => {
                           : 'No roster uploaded'}
                       </span>
                     </div>
-                    {selectedKey.rosterUploaded && (
+                    {(selectedKey.rosterUploaded || selectedKey.maxStudentCount > 0) && (
                       <button
                         onClick={() => handleDownloadRosterExcel(selectedKey)}
                         disabled={downloadingRoster}

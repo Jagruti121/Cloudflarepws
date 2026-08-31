@@ -928,6 +928,20 @@ app.post('/api/product-keys/upload-roster', generalApiLimiter, requireSuperAdmin
       rosterUploadedBy: req.adminEmail,
     });
 
+    // FIX: Write rosterKeyId to college config/settings so teachers can load the roster
+    const keyData = keySnap.data();
+    if (keyData.tenantId) {
+      try {
+        const collegeSettingsRef = adminDb
+          .collection('colleges').doc(keyData.tenantId)
+          .collection('config').doc('settings');
+        await collegeSettingsRef.set({ rosterKeyId: keyId }, { merge: true });
+        console.log(`[RosterUpload] Wrote rosterKeyId=${keyId} to colleges/${keyData.tenantId}/config/settings`);
+      } catch (settingsErr) {
+        console.warn(`[RosterUpload] Could not write rosterKeyId to college settings:`, settingsErr.message);
+      }
+    }
+
     console.log(`[SuperAdmin:${req.adminEmail}] Roster uploaded for key ${keyId}: ${students.length} students`);
     res.json({ success: true, studentCount: students.length });
 
@@ -1116,9 +1130,27 @@ app.post('/api/product-keys/merge-roster', generalApiLimiter, requireSuperAdminA
       // Update the product key metadata
       await keyRef.update({
         maxStudentCount: totalAfter,
+        rosterUploaded: true,           // FIX: mark rosterUploaded so Download Excel button appears
         rosterMergedAt: FieldValue.serverTimestamp(),
         rosterMergedBy: req.adminEmail,
       });
+
+      // FIX: Also write rosterKeyId to the college config/settings so teachers can load the roster.
+      // The teacher wizard reads colleges/{tenantId}/config/settings.rosterKeyId to know
+      // which product key's master_roster subcollection to fetch.
+      const keyData = keySnap.data();
+      if (keyData.tenantId) {
+        try {
+          const collegeSettingsRef = adminDb
+            .collection('colleges').doc(keyData.tenantId)
+            .collection('config').doc('settings');
+          await collegeSettingsRef.set({ rosterKeyId: keyId }, { merge: true });
+          console.log(`[MergeRoster] Wrote rosterKeyId=${keyId} to colleges/${keyData.tenantId}/config/settings`);
+        } catch (settingsErr) {
+          // Non-fatal — roster data was saved; log and continue
+          console.warn(`[MergeRoster] Could not write rosterKeyId to college settings:`, settingsErr.message);
+        }
+      }
 
       console.log(`[SuperAdmin:${req.adminEmail}] Roster MERGED for key ${keyId}: +${deltaStudents.length} new students (total: ${totalAfter})`);
       return res.json({
