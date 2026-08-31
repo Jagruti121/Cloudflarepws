@@ -37,6 +37,14 @@ const ExamInterface = () => {
   const autoSaveTimerRef = useRef(null);
   const isAutoSavingRef = useRef(false);
 
+  // ── Save Draft throttle state ──
+  // Tracks the last time a Save Draft call was actually sent to the DB.
+  // Ensures only ONE DB write per 10-minute window, even if the button
+  // is clicked rapidly or multiple times.
+  const saveDraftLastFiredRef = useRef(null); // timestamp (ms) of last successful DB write
+  const isSaveDraftInFlightRef = useRef(false); // prevents concurrent in-flight calls
+  const [saveDraftStatus, setSaveDraftStatus] = useState(''); // '' | 'saving' | 'saved' | 'throttled' | 'error'
+
   // ── Feature 4: Previous status tracking for rejection detection ──
   const prevStatusRef = useRef(null);
 
@@ -199,29 +207,19 @@ const ExamInterface = () => {
     }
   }, [tenantId, sessionCode, rollNo]);
 
-  // ── 10-Minute auto-save loop ──────────────────────────────────────────────
-  // Timer lifecycle is decoupled from `answers` — only depends on stable
-  // identifiers and the student's lock/exam state.
-  const AUTO_SAVE_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+  // ── 10-Minute throttle constant (shared by Save Draft button & force-end) ──
+  const SAVE_DRAFT_THROTTLE_MS = 10 * 60 * 1000; // 10 minutes
 
-  useEffect(() => {
-    if (!student || !tenantId || !sessionCode || !rollNo) return;
-    if (student.exam_type === 'internal') return;
-
-    const isLocked = ['approval_requested', 'submitted'].includes(student.status) || student.session_ended;
-    if (isLocked) return;
-
-    // Fire once immediately on mount (catches any unsaved state from before
-    // this effect ran), then repeat every 10 minutes.
-    autoSaveTimerRef.current = setInterval(() => { performAutoSave(); }, AUTO_SAVE_INTERVAL_MS);
-
-    return () => { if (autoSaveTimerRef.current) clearInterval(autoSaveTimerRef.current); };
-  }, [student?.status, student?.session_ended, student?.exam_type, tenantId, sessionCode, rollNo, performAutoSave]);
+  // NOTE: The periodic auto-save timer has been removed.
+  // Students save manually via the "Save Draft" button.
+  // The force-end effect below still auto-saves when the teacher ends the session.
 
   // ── Teacher Force-End detection ───────────────────────────────────────────
   // When the teacher ends the session (is_active=false or session_ended=true),
-  // immediately clear the auto-save timer and force a final save BEFORE the
-  // component navigates away — guaranteeing zero data loss.
+  // immediately force a final save BEFORE the component navigates away.
+  // Handles BOTH exam types:
+  //   • Practical: calls performAutoSave (code + file refs)
+  //   • Internal (MCQ): directly writes selected_option for each question
   const hasForceEndFiredRef = useRef(false);
 
   useEffect(() => {
@@ -234,21 +232,91 @@ const ExamInterface = () => {
     if (teacherEndedGlobally || teacherEndedForStudent) {
       hasForceEndFiredRef.current = true;
 
-      // 1. Kill the 10-minute timer immediately
+      // Kill the timer ref (no longer used, but kept for safety)
       if (autoSaveTimerRef.current) {
         clearInterval(autoSaveTimerRef.current);
         autoSaveTimerRef.current = null;
       }
 
-      // 2. Force a final save (bypasses timer, ignores lock status)
-      performAutoSave().finally(() => {
-        // Navigation is handled by the existing onSnapshot listeners above
-        // (lines 54 and 78-79) which show alerts and redirect.
-        // This ensures the save completes before those navigate calls fire.
-        console.log('[AutoSave] Force-end final save completed.');
-      });
+      const currentStudent = studentRef_data.current;
+      const currentAnswers = answersRef.current;
+
+      if (!currentStudent) return;
+
+      if (currentStudent.exam_type === 'internal') {
+        // ── Internal (MCQ) force-end save ──
+        // performAutoSave skips internal exams, so we save MCQ answers directly.
+        const sRef = doc(db, 'colleges', tenantId, 'students', `${sessionCode}_${rollNo}`);
+        const dotUpdate = {};
+        Object.entries(currentAnswers).forEach(([qKey, qVal]) => {
+          dotUpdate[`answers.${qKey}.selected_option`] = qVal.selected_option || null;
+        });
+        if (Object.keys(dotUpdate).length > 0) {
+          updateDoc(sRef, dotUpdate).catch((e) => {
+            console.error('[ForceEnd] Internal exam save error:', e);
+          });
+        }
+        console.log('[ForceEnd] Internal exam answers saved on teacher end.');
+      } else {
+        // ── Practical force-end save ──
+        performAutoSave().finally(() => {
+          console.log('[AutoSave] Force-end final save completed.');
+        });
+      }
     }
-  }, [examConfig?.is_active, student?.session_ended, performAutoSave]);
+  }, [examConfig?.is_active, student?.session_ended, student?.exam_type, performAutoSave, tenantId, sessionCode, rollNo]);
+
+  // ── Save Draft handler (manual button, practical exams only) ─────────────
+  // Rules:
+  //  1. Only sends one DB call per 10-minute window regardless of how many times
+  //     the button is pressed.
+  //  2. If a call is already in-flight, subsequent clicks are silently dropped.
+  //  3. If the teacher ends the session, the force-end effect below saves
+  //     independently without going through this throttle.
+  const handleSaveDraft = useCallback(async () => {
+    if (isSaveDraftInFlightRef.current) return; // already in flight — drop click
+
+    const now = Date.now();
+    if (
+      saveDraftLastFiredRef.current !== null &&
+      now - saveDraftLastFiredRef.current < SAVE_DRAFT_THROTTLE_MS
+    ) {
+      // Within the 10-minute throttle window — show feedback and drop.
+      const remainingMs = SAVE_DRAFT_THROTTLE_MS - (now - saveDraftLastFiredRef.current);
+      const remainingMin = Math.ceil(remainingMs / 60000);
+      setSaveDraftStatus('throttled');
+      setTimeout(() => setSaveDraftStatus((s) => s === 'throttled' ? '' : s), 3000);
+      console.log(`[SaveDraft] Throttled — next save allowed in ~${remainingMin} min`);
+      return;
+    }
+
+    isSaveDraftInFlightRef.current = true;
+    setSaveDraftStatus('saving');
+
+    const saved = await performAutoSave();
+
+    if (saved) {
+      saveDraftLastFiredRef.current = Date.now();
+      setSaveDraftStatus('saved');
+      setTimeout(() => setSaveDraftStatus((s) => s === 'saved' ? '' : s), 3000);
+    } else {
+      // performAutoSave returns false if nothing changed or already saving —
+      // treat "nothing changed" as a soft success so the user gets feedback.
+      const currentStudent = studentRef_data.current;
+      const currentJson = JSON.stringify(answersRef.current);
+      if (currentJson === lastSavedAnswersRef.current) {
+        // Data hasn't changed since last save — already up to date.
+        setSaveDraftStatus('saved');
+        saveDraftLastFiredRef.current = Date.now();
+        setTimeout(() => setSaveDraftStatus((s) => s === 'saved' ? '' : s), 3000);
+      } else {
+        setSaveDraftStatus('error');
+        setTimeout(() => setSaveDraftStatus((s) => s === 'error' ? '' : s), 3000);
+      }
+    }
+
+    isSaveDraftInFlightRef.current = false;
+  }, [performAutoSave, SAVE_DRAFT_THROTTLE_MS]);
 
   const formatTime = (ms) => {
     if (ms === null) return "--:--:--";
@@ -810,6 +878,53 @@ const ExamInterface = () => {
                 </>
               )}
             </div>
+
+            {/* ── SAVE DRAFT BUTTON (Practical exams only) ──
+                Appears below the main action buttons. Only visible when the exam
+                is active (not submitted / not locked by teacher end).
+                The 10-minute throttle prevents DB spam even if pressed many times. */}
+            {student.exam_type !== 'internal' && !isLocked && student.status !== 'submitted' && (
+              <div className="bg-white rounded-lg shadow-md px-6 py-4 flex items-center justify-between border-t border-gray-100 mt-2">
+                <div className="text-sm text-gray-500">
+                  💾 Save your progress to the database manually.
+                </div>
+                <div className="flex items-center gap-3">
+                  {/* Save Draft status feedback */}
+                  {saveDraftStatus === 'saving' && (
+                    <div className="flex items-center gap-2 text-sm font-medium text-blue-700">
+                      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                      Saving...
+                    </div>
+                  )}
+                  {saveDraftStatus === 'saved' && (
+                    <div className="flex items-center gap-1.5 text-sm font-medium text-green-700">
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="3"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+                      Draft Saved!
+                    </div>
+                  )}
+                  {saveDraftStatus === 'throttled' && (
+                    <div className="flex items-center gap-1.5 text-sm font-medium text-orange-600">
+                      ⏳ Already saved recently. Please wait before saving again.
+                    </div>
+                  )}
+                  {saveDraftStatus === 'error' && (
+                    <div className="flex items-center gap-1.5 text-sm font-medium text-red-600">
+                      ⚠ Save failed. Try again.
+                    </div>
+                  )}
+                  <button
+                    onClick={handleSaveDraft}
+                    disabled={saveDraftStatus === 'saving' || isSubmitting}
+                    className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2.5 rounded-lg font-bold shadow transition disabled:opacity-50 flex items-center gap-2"
+                  >
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
+                    </svg>
+                    Save Draft
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           {examConfig?.allowed_url && (

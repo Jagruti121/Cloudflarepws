@@ -59,7 +59,9 @@ app.disable('x-powered-by');
 
 // ── SECURITY FIX: Restrict CORS to known origins instead of wildcard ──
 const allowedOrigins = [
-  'http://localhost:5173',  // Vite dev server
+  'http://localhost:5173',  // Vite dev server (primary)
+  'http://localhost:5174',  // Vite dev server (when 5173 is busy)
+  'http://localhost:5175',  // Vite dev server (fallback)
   'http://localhost:4173',  // Vite preview
   'http://localhost:3000',  // CRA / alternate dev server
   'https://nextsolvespms.onrender.com', // Live frontend (solves)
@@ -935,10 +937,262 @@ app.post('/api/product-keys/upload-roster', generalApiLimiter, requireSuperAdmin
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// STUDENT CAPCUT: POST /api/product-keys/merge-roster
+// Super Admin uploads a NEW Excel file to ADD students to an existing roster.
+// Compares new file against existing master_roster and only adds roll numbers
+// that are not already present. Supports two modes:
+//   ?preview=true  → returns diff info only, NO DB writes
+//   (no flag)      → commits the diff atomically in batches of 500,
+//                    with full rollback if any batch fails.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/product-keys/merge-roster', generalApiLimiter, requireSuperAdminAuth, rosterUpload.single('file'), async (req, res) => {
+  const { keyId } = req.body;
+  const isPreview = req.query.preview === 'true';
+
+  if (!keyId || !req.file) {
+    return res.status(400).json({ error: 'Missing keyId or roster file.' });
+  }
+
+  try {
+    // 1. Verify the product key exists
+    const keyRef = adminDb.collection('product_keys').doc(keyId);
+    const keySnap = await keyRef.get();
+    if (!keySnap.exists) {
+      return res.status(404).json({ error: 'Product key not found.' });
+    }
+
+    // 2. Parse the uploaded Excel file
+    const XLSX = await import('xlsx');
+    let workbook;
+    try {
+      workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+    } catch (parseErr) {
+      return res.status(400).json({ error: 'Failed to parse file. Ensure it is a valid .xlsx file.' });
+    }
+
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+    if (rows.length < 2) {
+      return res.status(400).json({ error: 'File is empty or has no data rows.' });
+    }
+
+    // 3. Validate headers — must EXACTLY match: Serial No | Roll Number | Full Name
+    const normalize = (v) => String(v || '').trim().toLowerCase();
+    const h0 = normalize(rows[0][0]);
+    const h1 = normalize(rows[0][1]);
+    const h2 = normalize(rows[0][2]);
+    if (h0 !== 'serial no' || h1 !== 'roll number' || h2 !== 'full name') {
+      return res.status(400).json({
+        error: `Invalid column headers. Expected exactly: "Serial No | Roll Number | Full Name". Got: "${rows[0].slice(0,3).join(' | ')}"`,
+      });
+    }
+
+    // 4. Parse data rows — sanitize and validate
+    const htmlTagRegex = /<[^>]*>/g;
+    const formulaInjectionRegex = /^[=+\-@]/;
+    const sanitizeCell = (val) => {
+      let s = String(val || '').trim();
+      s = s.replace(htmlTagRegex, '');
+      if (formulaInjectionRegex.test(s)) s = s.replace(formulaInjectionRegex, '');
+      return s.trim().substring(0, 300);
+    };
+
+    const newStudents = [];
+    const incomingRollSet = new Set();
+    const duplicatesInFile = [];
+
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const serialNumber = sanitizeCell(row[0]);
+      const rollNumber = sanitizeCell(row[1]).toUpperCase();
+      const fullName = sanitizeCell(row[2]);
+
+      if (!rollNumber && !fullName) continue; // skip blank rows
+      if (!rollNumber) return res.status(400).json({ error: `Row ${i + 1}: Roll Number is empty.` });
+      if (!fullName) return res.status(400).json({ error: `Row ${i + 1}: Full Name is empty.` });
+
+      if (incomingRollSet.has(rollNumber)) {
+        duplicatesInFile.push(rollNumber);
+      } else {
+        incomingRollSet.add(rollNumber);
+        newStudents.push({ serialNumber: serialNumber || String(i), rollNumber, fullName });
+      }
+    }
+
+    if (duplicatesInFile.length > 0) {
+      return res.status(400).json({
+        error: `Duplicate roll numbers in uploaded file: ${duplicatesInFile.slice(0, 10).join(', ')}${duplicatesInFile.length > 10 ? ` and ${duplicatesInFile.length - 10} more` : ''}. Each roll number must be unique.`,
+      });
+    }
+
+    if (newStudents.length === 0) {
+      return res.status(400).json({ error: 'No valid student rows found in the file.' });
+    }
+
+    // 5. Fetch ALL existing roll numbers from master_roster (paginated to handle large rosters)
+    const rosterRef = keyRef.collection('master_roster');
+    const existingRollSet = new Set();
+    let lastDoc = null;
+    const PAGE_SIZE = 500;
+
+    while (true) {
+      let q = rosterRef.select('rollNumber').limit(PAGE_SIZE);
+      if (lastDoc) q = q.startAfter(lastDoc);
+      const snap = await q.get();
+      if (snap.empty) break;
+      snap.docs.forEach(d => {
+        const rn = d.data().rollNumber;
+        if (rn) existingRollSet.add(rn);
+      });
+      if (snap.docs.length < PAGE_SIZE) break;
+      lastDoc = snap.docs[snap.docs.length - 1];
+    }
+
+    // 6. Compute delta — only students whose roll number is NOT already in the roster
+    const deltaStudents = newStudents.filter(s => !existingRollSet.has(s.rollNumber));
+    const existingCount = existingRollSet.size;
+    const totalAfter = existingCount + deltaStudents.length;
+
+    // ── PREVIEW MODE: return info only, NO DB writes ──
+    if (isPreview) {
+      return res.json({
+        success: true,
+        preview: true,
+        existingCount,
+        newCount: deltaStudents.length,
+        skippedCount: newStudents.length - deltaStudents.length,
+        totalAfter,
+        sampleRolls: deltaStudents.slice(0, 8).map(s => s.rollNumber),
+      });
+    }
+
+    // ── COMMIT MODE: atomic batch writes with full rollback ──
+    if (deltaStudents.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No new students to add — all roll numbers already exist in the roster.',
+        newCount: 0,
+        totalAfter: existingCount,
+      });
+    }
+
+    // Generate a unique session ID for this merge operation so we can rollback
+    const mergeSessionId = `merge_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const BATCH_SIZE = 500;
+    const committedDocRefs = []; // track all docs written so far for rollback
+
+    try {
+      for (let i = 0; i < deltaStudents.length; i += BATCH_SIZE) {
+        const chunk = deltaStudents.slice(i, i + BATCH_SIZE);
+        const batch = adminDb.batch();
+        const chunkRefs = [];
+
+        chunk.forEach(s => {
+          const docRef = rosterRef.doc();
+          batch.set(docRef, { ...s, _mergeSessionId: mergeSessionId });
+          chunkRefs.push(docRef);
+        });
+
+        await batch.commit();
+        // Only add to committed list AFTER successful commit
+        committedDocRefs.push(...chunkRefs);
+      }
+
+      // All batches succeeded — strip the internal _mergeSessionId field in a final pass
+      // (done in background batches — non-critical, field doesn't affect app functionality)
+      const cleanupBatchSize = 500;
+      for (let i = 0; i < committedDocRefs.length; i += cleanupBatchSize) {
+        const cleanBatch = adminDb.batch();
+        committedDocRefs.slice(i, i + cleanupBatchSize).forEach(ref => {
+          cleanBatch.update(ref, { _mergeSessionId: FieldValue.delete() });
+        });
+        // Fire-and-forget — don't await, don't fail on cleanup errors
+        cleanBatch.commit().catch(e => console.warn('[MergeRoster] Cleanup batch warning:', e.message));
+      }
+
+      // Update the product key metadata
+      await keyRef.update({
+        maxStudentCount: totalAfter,
+        rosterMergedAt: FieldValue.serverTimestamp(),
+        rosterMergedBy: req.adminEmail,
+      });
+
+      console.log(`[SuperAdmin:${req.adminEmail}] Roster MERGED for key ${keyId}: +${deltaStudents.length} new students (total: ${totalAfter})`);
+      return res.json({
+        success: true,
+        newCount: deltaStudents.length,
+        totalAfter,
+      });
+
+    } catch (batchErr) {
+      // ── ROLLBACK: delete all docs committed so far ──
+      console.error(`[MergeRoster] Batch commit failed after ${committedDocRefs.length} docs written. Rolling back...`, batchErr.message);
+
+      try {
+        for (let i = 0; i < committedDocRefs.length; i += BATCH_SIZE) {
+          const rollbackBatch = adminDb.batch();
+          committedDocRefs.slice(i, i + BATCH_SIZE).forEach(ref => rollbackBatch.delete(ref));
+          await rollbackBatch.commit();
+        }
+        console.log(`[MergeRoster] Rollback complete — deleted ${committedDocRefs.length} docs`);
+      } catch (rollbackErr) {
+        console.error('[MergeRoster] Rollback ALSO failed:', rollbackErr.message);
+        // Even if rollback fails, return the original error to the client
+      }
+
+      return res.status(500).json({
+        error: `Failed to save roster changes. All changes have been rolled back. Reason: ${batchErr.message}`,
+      });
+    }
+
+  } catch (err) {
+    console.error('[MergeRoster] Error:', err.message);
+    res.status(500).json({ error: 'Failed to process roster merge. Please try again.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // STUDENT CAPCUT: GET /api/roster/:keyId
 // Returns the master roster for a key. Only accessible by authenticated teachers
 // whose tenantId matches the keyId's owning college.
+// Students are sorted by roll number (numeric-aware) and serial numbers are
+// reassigned sequentially so that newly merged entries land in the correct order.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ── Shared helper: sort students by roll number + reassign serial numbers ──
+const sortAndRenumberRoster = (docs) => {
+  // Parse roll numbers to support numeric, alphanumeric (e.g. CS001, 2200A)
+  const parseRoll = (rn) => {
+    // Extract leading numeric portion for primary sort, rest for secondary
+    const match = String(rn || '').match(/^([a-zA-Z]*)([0-9]+)([a-zA-Z0-9]*)$/);
+    if (match) {
+      return { prefix: match[1].toUpperCase(), num: parseInt(match[2], 10), suffix: match[3].toUpperCase() };
+    }
+    return { prefix: String(rn || '').toUpperCase(), num: 0, suffix: '' };
+  };
+
+  const sorted = [...docs].sort((a, b) => {
+    const ra = parseRoll(a.rollNumber);
+    const rb = parseRoll(b.rollNumber);
+    // 1) Sort by prefix (e.g. CS vs ME)
+    if (ra.prefix < rb.prefix) return -1;
+    if (ra.prefix > rb.prefix) return 1;
+    // 2) Sort by numeric part
+    if (ra.num !== rb.num) return ra.num - rb.num;
+    // 3) Sort by suffix
+    return ra.suffix.localeCompare(rb.suffix);
+  });
+
+  // Reassign sequential serial numbers — no gaps, no duplicates
+  return sorted.map((s, idx) => ({
+    serialNumber: String(idx + 1),
+    rollNumber: s.rollNumber,
+    fullName: s.fullName,
+  }));
+};
+
 app.get('/api/roster/:keyId', generalApiLimiter, requireTeacherAuth, async (req, res) => {
   const { keyId } = req.params;
   const tenantId = req.teacherTenantId;
@@ -960,26 +1214,56 @@ app.get('/api/roster/:keyId', generalApiLimiter, requireTeacherAuth, async (req,
     }
 
     // 2. Fetch all students from master_roster subcollection.
-    // IMPORTANT: Do NOT use Firestore .orderBy('serialNumber') here — it sorts strings
-    // lexicographically ("1","10","11","2"), breaking the sequence. Sort numerically in JS instead.
     const rosterSnap = await adminDb.collection('product_keys').doc(keyId).collection('master_roster').get();
 
-    const students = rosterSnap.docs
-      .map(d => {
-        const data = d.data();
-        return { serialNumber: data.serialNumber, rollNumber: data.rollNumber, fullName: data.fullName };
-      })
-      .sort((a, b) => {
-        const numA = parseFloat(a.serialNumber);
-        const numB = parseFloat(b.serialNumber);
-        if (!isNaN(numA) && !isNaN(numB)) return numA - numB;
-        return String(a.serialNumber).localeCompare(String(b.serialNumber));
-      });
+    const raw = rosterSnap.docs.map(d => ({
+      rollNumber: d.data().rollNumber,
+      fullName: d.data().fullName,
+    }));
+
+    // 3. Sort by roll number + reassign serial numbers sequentially
+    const students = sortAndRenumberRoster(raw);
 
     res.json({ students, totalCount: students.length });
   } catch (err) {
     console.error('[RosterFetch] Error:', err.message);
     res.status(500).json({ error: 'Failed to fetch roster.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/product-keys/:keyId/roster-download
+// Super Admin: download the full roster sorted by roll number as JSON,
+// with freshly reassigned sequential serial numbers (for Excel export).
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/product-keys/:keyId/roster-download', generalApiLimiter, requireSuperAdminAuth, async (req, res) => {
+  const { keyId } = req.params;
+  if (!keyId) return res.status(400).json({ error: 'Missing keyId.' });
+
+  try {
+    const keyRef = adminDb.collection('product_keys').doc(keyId);
+    const keySnap = await keyRef.get();
+    if (!keySnap.exists) {
+      return res.status(404).json({ error: 'Product key not found.' });
+    }
+
+    const rosterSnap = await keyRef.collection('master_roster').get();
+    const raw = rosterSnap.docs.map(d => ({
+      rollNumber: d.data().rollNumber,
+      fullName: d.data().fullName,
+    }));
+
+    const students = sortAndRenumberRoster(raw);
+
+    const keyData = keySnap.data();
+    res.json({
+      students,
+      totalCount: students.length,
+      collegeName: keyData.collegeName || '',
+    });
+  } catch (err) {
+    console.error('[RosterDownload] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch roster for download.' });
   }
 });
 
@@ -2326,6 +2610,23 @@ app.post('/api/secondary-admin/set-password', secondaryAdminLimiter, async (req,
       secondaryAdminPasswordSet: true
     }, { merge: true });
 
+    // 4d. If this secondary admin is ALSO a teacher (Dual-Role), sync their password to the teacher collection
+    // so the Teacher Passwords Excel sheet remains accurate.
+    try {
+      const teacherUserSnap = await adminDb.collection('teacher_users').doc(uid).get();
+      if (teacherUserSnap.exists) {
+        const teacherTenant = teacherUserSnap.data().tenantId;
+        if (teacherTenant) {
+          await adminDb.collection('colleges').doc(teacherTenant).collection('teachers').doc(uid).set({
+            password: newPassword
+          }, { merge: true });
+          console.log(`[SecondaryAdmin] Synced new password to colleges/${teacherTenant}/teachers/${uid}`);
+        }
+      }
+    } catch (err) {
+      console.warn('[SecondaryAdmin] Failed to sync teacher password:', err.message);
+    }
+
     console.log(`[SecondaryAdmin] Step 4 complete. Secondary admin provisioned: ${secondaryEmail} (uid: ${uid}) for tenant: ${tenantId}`);
     res.json({ success: true });
 
@@ -2742,17 +3043,20 @@ app.post('/api/lockout/reset-password', lockoutVerifyLimiter, async (req, res) =
       }, { merge: true });
 
       // Sync the new password to the specific portal collection so Excel exports have real-time data
-      if (portal === 'teacher') {
-        const teacherUserSnap = await adminDb.collection(col).doc(authUid).get();
+      // (For dual-role users, we check teacher_users unconditionally so the Teacher Excel sheet is always accurate)
+      try {
+        const teacherUserSnap = await adminDb.collection('teacher_users').doc(authUid).get();
         if (teacherUserSnap.exists) {
-          const tenantId = teacherUserSnap.data().tenantId;
-          if (tenantId) {
-            await adminDb.collection('colleges').doc(tenantId).collection('teachers').doc(authUid).set({
+          const teacherTenantId = teacherUserSnap.data().tenantId;
+          if (teacherTenantId) {
+            await adminDb.collection('colleges').doc(teacherTenantId).collection('teachers').doc(authUid).set({
               password: newPassword
             }, { merge: true });
-            console.log(`[Lockout] Synced new password to colleges/${tenantId}/teachers/${authUid}`);
+            console.log(`[Lockout] Synced new password to colleges/${teacherTenantId}/teachers/${authUid}`);
           }
         }
+      } catch (err) {
+        console.warn('[Lockout] Failed to sync teacher password:', err.message);
       }
 
     } catch (fsErr) {

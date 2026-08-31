@@ -1,9 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { collection, onSnapshot, query, orderBy, doc, updateDoc, getDoc, deleteDoc, Timestamp } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from '../../firebase';
 import KeyGenerator from './KeyGenerator';
+import ExcelJS from 'exceljs';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 
@@ -29,6 +30,19 @@ const SuperAdminDashboard = () => {
   // ── Delete state ──
   const [confirmDeleteKey, setConfirmDeleteKey] = useState(null); // key object to delete
   const [deletingKeyId, setDeletingKeyId] = useState(null);
+
+  // ── Edit Roster Merge state ──
+  const [editRosterFile, setEditRosterFile] = useState(null);
+  const [editRosterFileError, setEditRosterFileError] = useState('');
+  const [editRosterPreview, setEditRosterPreview] = useState(null);
+  // { existingCount, newCount, skippedCount, totalAfter, sampleRolls }
+  const [editRosterUploading, setEditRosterUploading] = useState(false);
+  const [editRosterUploadProgress, setEditRosterUploadProgress] = useState('');
+  const editRosterInputRef = useRef(null);
+
+  // ── Roster download state (view mode) ──
+  const [downloadingRoster, setDownloadingRoster] = useState(false);
+
 
   // Helper to calculate days left
   const calculateDaysLeft = (validUntilDate) => {
@@ -160,7 +174,58 @@ const SuperAdminDashboard = () => {
   };
 
 
+  // ── Download roster as Excel (view mode) ──
+  const handleDownloadRosterExcel = async (keyObj) => {
+    if (!keyObj?.id) return;
+    setDownloadingRoster(true);
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      const resp = await fetch(`${API_URL}/api/product-keys/${keyObj.id}/roster-download`, {
+        headers: { 'Authorization': `Bearer ${idToken}` },
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Failed to fetch roster.');
+
+      // Build Excel workbook using ExcelJS (same format as upload)
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet('Student Roster');
+
+      sheet.columns = [
+        { header: 'Serial No',   key: 'serialNumber', width: 12 },
+        { header: 'Roll Number', key: 'rollNumber',   width: 18 },
+        { header: 'Full Name',   key: 'fullName',     width: 36 },
+      ];
+
+      // Style header row
+      sheet.getRow(1).eachCell(cell => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F1F3A' } };
+      });
+
+      // Data rows
+      data.students.forEach(s => sheet.addRow({
+        serialNumber: s.serialNumber,
+        rollNumber: s.rollNumber,
+        fullName: s.fullName,
+      }));
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${(data.collegeName || keyObj.collegeName || 'college').replace(/[^a-zA-Z0-9]/g, '_')}_student_roster.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert('Failed to download roster: ' + err.message);
+    } finally {
+      setDownloadingRoster(false);
+    }
+  };
+
   const handleEditClick = () => {
+
     const dateStr = selectedKey.validUntil
       ? new Date(selectedKey.validUntil).toISOString().split('T')[0]
       : '';
@@ -181,7 +246,77 @@ const SuperAdminDashboard = () => {
       paymentTxnId: selectedKey.paymentTxnId || '',
       facultyEmails: paddedEmails,
     });
+    // Reset roster state when opening edit
+    setEditRosterFile(null);
+    setEditRosterFileError('');
+    setEditRosterPreview(null);
+    setEditRosterUploading(false);
+    setEditRosterUploadProgress('');
+    if (editRosterInputRef.current) editRosterInputRef.current.value = '';
     setIsEditing(true);
+  };
+
+  // ── Client-side validation for the roster file in edit mode (same rules as KeyGenerator) ──
+  const handleEditRosterFileChange = async (e) => {
+    const file = e.target.files[0];
+    setEditRosterPreview(null);
+    if (!file) {
+      setEditRosterFile(null);
+      setEditRosterFileError('');
+      return;
+    }
+    setEditRosterFileError('');
+    setEditRosterFile(null);
+    try {
+      const buffer = await file.arrayBuffer();
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(buffer);
+      const worksheet = workbook.getWorksheet(1);
+      if (!worksheet) {
+        setEditRosterFileError('The Excel file is empty or invalid.');
+        return;
+      }
+      const headerRow = worksheet.getRow(1);
+      const getVal = (col) => {
+        const val = headerRow.getCell(col).value;
+        return val ? String(val).trim().toLowerCase() : '';
+      };
+      if (getVal(1) !== 'serial no' || getVal(2) !== 'roll number' || getVal(3) !== 'full name') {
+        setEditRosterFileError('Invalid columns. File must have exactly: "Serial No | Roll Number | Full Name"');
+        return;
+      }
+      setEditRosterFile(file);
+    } catch (err) {
+      console.error('Error parsing roster Excel:', err);
+      setEditRosterFileError('Failed to parse Excel file. Please ensure it is a valid .xlsx file.');
+    }
+  };
+
+  // ── Call preview endpoint — no DB writes ──
+  const handleEditRosterPreview = async () => {
+    if (!editRosterFile || !selectedKey?.id) return;
+    setEditRosterUploading(true);
+    setEditRosterUploadProgress('Analysing file against existing roster...');
+    setEditRosterPreview(null);
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      const formDataObj = new FormData();
+      formDataObj.append('keyId', selectedKey.id);
+      formDataObj.append('file', editRosterFile);
+      const resp = await fetch(`${API_URL}/api/product-keys/merge-roster?preview=true`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${idToken}` },
+        body: formDataObj,
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Preview failed.');
+      setEditRosterPreview(data);
+    } catch (err) {
+      setEditRosterFileError('Preview error: ' + err.message);
+    } finally {
+      setEditRosterUploading(false);
+      setEditRosterUploadProgress('');
+    }
   };
 
   // Sync faculty email slots when facultyLimit changes in edit mode
@@ -213,6 +348,11 @@ const SuperAdminDashboard = () => {
     }
     if (!editData.adminEmail.trim()) {
       alert('Admin email cannot be empty.');
+      return;
+    }
+    // Block if a roster file is loaded but not previewed yet
+    if (editRosterFile && !editRosterPreview) {
+      alert('Please click "Preview Changes" to verify the roster diff before saving.');
       return;
     }
     setSavingKey(true);
@@ -247,6 +387,35 @@ const SuperAdminDashboard = () => {
           });
         } catch (e) {
           console.warn('Could not update college config, it might not exist yet.', e);
+        }
+      }
+
+      // ── Roster merge commit (if a file was loaded and previewed) ──
+      if (editRosterFile && editRosterPreview && editRosterPreview.newCount > 0) {
+        setEditRosterUploadProgress(`Adding ${editRosterPreview.newCount} new students in the background...`);
+        try {
+          const idToken = await auth.currentUser.getIdToken();
+          const formDataObj = new FormData();
+          formDataObj.append('keyId', selectedKey.id);
+          formDataObj.append('file', editRosterFile);
+          const mergeResp = await fetch(`${API_URL}/api/product-keys/merge-roster`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${idToken}` },
+            body: formDataObj,
+          });
+          const mergeData = await mergeResp.json();
+          if (!mergeResp.ok) {
+            throw new Error(mergeData.error || 'Roster merge failed.');
+          }
+          setEditRosterUploadProgress('');
+        } catch (mergeErr) {
+          setEditRosterUploadProgress('');
+          // Field updates already saved — report roster error separately
+          alert(`Key details saved successfully, but roster update failed:\n${mergeErr.message}\n\nPlease try uploading the roster again.`);
+          setSavingKey(false);
+          setSelectedKey({ ...selectedKey, ...updatePayload });
+          setIsEditing(false);
+          return;
         }
       }
 
@@ -696,6 +865,121 @@ const SuperAdminDashboard = () => {
                   </div>
                 )}
 
+                {/* ── Roster Merge Upload Section ── */}
+                <div style={{ marginTop: '24px', paddingTop: '20px', borderTop: '1px solid rgba(255,255,255,0.07)' }}>
+                  <p style={{ color: 'rgba(255,255,255,0.45)', fontSize: '11px', fontWeight: '600', letterSpacing: '1.2px', textTransform: 'uppercase', marginBottom: '8px' }}>
+                    📋 Update Student Roster (Optional)
+                  </p>
+                  <p style={{ color: 'rgba(255,255,255,0.35)', fontSize: '12px', marginBottom: '14px', lineHeight: '1.6' }}>
+                    Upload a new <strong style={{ color: 'rgba(255,255,255,0.6)' }}>.xlsx</strong> file to <strong style={{ color: 'rgba(255,255,255,0.6)' }}>add</strong> new students.
+                    Existing roll numbers will not be duplicated.
+                    Required columns: <span style={{ fontFamily: 'Fira Code, monospace', color: '#fbbf24', fontSize: '11px' }}>Serial No | Roll Number | Full Name</span>
+                  </p>
+
+                  <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                    <div style={{ flex: 1, minWidth: '220px' }}>
+                      <input
+                        ref={editRosterInputRef}
+                        type="file"
+                        accept=".xlsx"
+                        onChange={handleEditRosterFileChange}
+                        className="sa-input"
+                        style={{ padding: '8px', cursor: 'pointer' }}
+                      />
+                    </div>
+                    {editRosterFile && !editRosterFileError && (
+                      <button
+                        type="button"
+                        onClick={handleEditRosterPreview}
+                        disabled={editRosterUploading}
+                        style={{
+                          padding: '9px 18px',
+                          background: editRosterUploading ? 'rgba(255,255,255,0.05)' : 'rgba(0,191,255,0.15)',
+                          border: '1px solid rgba(0,191,255,0.3)',
+                          borderRadius: '6px',
+                          color: '#00bfff',
+                          fontSize: '13px',
+                          fontWeight: '600',
+                          cursor: editRosterUploading ? 'not-allowed' : 'pointer',
+                          whiteSpace: 'nowrap',
+                          flexShrink: 0,
+                          transition: 'all 0.2s',
+                        }}
+                      >
+                        {editRosterUploading ? '⏳ Analysing...' : '🔍 Preview Changes'}
+                      </button>
+                    )}
+                  </div>
+
+                  {/* File validation error */}
+                  {editRosterFileError && (
+                    <div style={{ marginTop: '8px', padding: '8px 12px', background: 'rgba(180,0,60,0.1)', border: '1px solid rgba(180,0,60,0.3)', borderRadius: '6px', color: '#ff6b8a', fontSize: '12px' }}>
+                      ⚠ {editRosterFileError}
+                    </div>
+                  )}
+
+                  {/* Upload progress text */}
+                  {editRosterUploadProgress && (
+                    <div style={{ marginTop: '8px', color: 'rgba(255,255,255,0.5)', fontSize: '12px', fontStyle: 'italic' }}>
+                      ⏳ {editRosterUploadProgress}
+                    </div>
+                  )}
+
+                  {/* Preview result panel */}
+                  {editRosterPreview && (
+                    <div style={{
+                      marginTop: '12px',
+                      padding: '14px 16px',
+                      background: editRosterPreview.newCount === 0
+                        ? 'rgba(255,165,0,0.06)'
+                        : 'rgba(0,200,100,0.06)',
+                      border: `1px solid ${editRosterPreview.newCount === 0 ? 'rgba(255,165,0,0.2)' : 'rgba(0,200,100,0.2)'}`,
+                      borderRadius: '8px',
+                    }}>
+                      <p style={{ margin: '0 0 10px', fontWeight: '700', fontSize: '13px', color: editRosterPreview.newCount === 0 ? '#fbbf24' : '#4ade80' }}>
+                        {editRosterPreview.newCount === 0 ? '⚠ No New Students' : '✅ Preview Ready — Roster Diff'}
+                      </p>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px', marginBottom: editRosterPreview.newCount > 0 ? '12px' : '0' }}>
+                        <div style={{ textAlign: 'center', padding: '8px', background: 'rgba(0,0,0,0.25)', borderRadius: '6px' }}>
+                          <div style={{ fontSize: '20px', fontWeight: '700', color: '#e0e0e0' }}>{editRosterPreview.existingCount}</div>
+                          <div style={{ fontSize: '10px', color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: '0.8px', marginTop: '2px' }}>Existing</div>
+                        </div>
+                        <div style={{ textAlign: 'center', padding: '8px', background: 'rgba(0,0,0,0.25)', borderRadius: '6px' }}>
+                          <div style={{ fontSize: '20px', fontWeight: '700', color: editRosterPreview.newCount > 0 ? '#4ade80' : '#fbbf24' }}>+{editRosterPreview.newCount}</div>
+                          <div style={{ fontSize: '10px', color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: '0.8px', marginTop: '2px' }}>To Add</div>
+                        </div>
+                        <div style={{ textAlign: 'center', padding: '8px', background: 'rgba(0,0,0,0.25)', borderRadius: '6px' }}>
+                          <div style={{ fontSize: '20px', fontWeight: '700', color: '#60a5fa' }}>{editRosterPreview.totalAfter}</div>
+                          <div style={{ fontSize: '10px', color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: '0.8px', marginTop: '2px' }}>Total After</div>
+                        </div>
+                      </div>
+                      {editRosterPreview.skippedCount > 0 && (
+                        <p style={{ margin: '0 0 8px', fontSize: '11px', color: 'rgba(255,165,0,0.7)' }}>
+                          ⤷ {editRosterPreview.skippedCount} roll number{editRosterPreview.skippedCount !== 1 ? 's' : ''} already exist and will be skipped.
+                        </p>
+                      )}
+                      {editRosterPreview.newCount > 0 && editRosterPreview.sampleRolls?.length > 0 && (
+                        <div>
+                          <p style={{ margin: '0 0 6px', fontSize: '11px', color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: '0.8px' }}>Sample New Roll Numbers:</p>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                            {editRosterPreview.sampleRolls.map((r, i) => (
+                              <span key={i} style={{ padding: '3px 8px', background: 'rgba(0,200,100,0.1)', border: '1px solid rgba(0,200,100,0.2)', borderRadius: '4px', fontSize: '11px', fontFamily: 'Fira Code, monospace', color: '#4ade80' }}>{r}</span>
+                            ))}
+                            {editRosterPreview.newCount > editRosterPreview.sampleRolls.length && (
+                              <span style={{ padding: '3px 8px', fontSize: '11px', color: 'rgba(255,255,255,0.3)' }}>+{editRosterPreview.newCount - editRosterPreview.sampleRolls.length} more</span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                      {editRosterPreview.newCount === 0 && (
+                        <p style={{ margin: '0', fontSize: '12px', color: 'rgba(255,165,0,0.7)' }}>
+                          All roll numbers in this file already exist in the roster. No changes will be made.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 {/* Tenant ID (read-only info) */}
                 <div style={{ marginTop: '16px', padding: '10px 12px', background: 'rgba(255,255,255,0.03)', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.07)' }}>
                   <div style={{ fontSize: '11px', color: 'rgba(255,255,255,0.35)', letterSpacing: '1px', textTransform: 'uppercase', marginBottom: '4px' }}>Tenant ID (read-only)</div>
@@ -705,7 +989,7 @@ const SuperAdminDashboard = () => {
                 {/* Action Buttons */}
                 <div style={{ marginTop: '24px', display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
                   <button className="dash-btn-secondary" onClick={() => setIsEditing(false)}>Cancel</button>
-                  <button className="dash-btn-primary" onClick={handleSaveEdit} disabled={savingKey}>
+                  <button className="dash-btn-primary" onClick={handleSaveEdit} disabled={savingKey || editRosterUploading}>
                     {savingKey ? '⏳ Saving...' : '💾 Save Changes'}
                   </button>
                 </div>
@@ -738,6 +1022,48 @@ const SuperAdminDashboard = () => {
                   </span>
                 </div>
 
+                {/* Student Roster Count + Download Excel */}
+                <div style={{ marginTop: '4px', paddingTop: '16px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                    <div>
+                      <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: '13px' }}>Student Roster:</span>
+                      <span style={{
+                        marginLeft: '10px',
+                        fontSize: '14px',
+                        fontWeight: '700',
+                        color: selectedKey.maxStudentCount ? '#4ade80' : 'rgba(255,255,255,0.35)',
+                      }}>
+                        {selectedKey.maxStudentCount
+                          ? `${Number(selectedKey.maxStudentCount).toLocaleString()} students`
+                          : 'No roster uploaded'}
+                      </span>
+                    </div>
+                    {selectedKey.rosterUploaded && (
+                      <button
+                        onClick={() => handleDownloadRosterExcel(selectedKey)}
+                        disabled={downloadingRoster}
+                        style={{
+                          padding: '7px 16px',
+                          background: downloadingRoster ? 'rgba(255,255,255,0.05)' : 'rgba(0,200,100,0.12)',
+                          border: '1px solid rgba(0,200,100,0.3)',
+                          borderRadius: '6px',
+                          color: '#4ade80',
+                          fontSize: '12px',
+                          fontWeight: '600',
+                          cursor: downloadingRoster ? 'not-allowed' : 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          transition: 'all 0.2s',
+                          flexShrink: 0,
+                        }}
+                      >
+                        {downloadingRoster ? '⏳ Downloading...' : '⬇️ Download Roster Excel'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
                 {/* Faculty Emails */}
                 {selectedKey.facultyEmails && selectedKey.facultyEmails.length > 0 && (
                   <div style={{ marginTop: '8px', paddingTop: '16px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
@@ -751,6 +1077,7 @@ const SuperAdminDashboard = () => {
                     </div>
                   </div>
                 )}
+
               </div>
             )}
           </div>

@@ -26,13 +26,22 @@ const RosterSelectionPanel = ({
   }, [selected, roster]);
 
   const sortedRoster = useMemo(() => {
+    // Parse roll numbers for alphanumeric-aware sorting (e.g. CS001, 2200A)
+    const parseRoll = (rn) => {
+      const match = String(rn || '').match(/^([a-zA-Z]*)([0-9]+)([a-zA-Z0-9]*)$/);
+      if (match) return { prefix: match[1].toUpperCase(), num: parseInt(match[2], 10), suffix: match[3].toUpperCase() };
+      return { prefix: String(rn || '').toUpperCase(), num: 0, suffix: '' };
+    };
     return [...roster].sort((a, b) => {
-      const numA = parseFloat(a.serialNumber);
-      const numB = parseFloat(b.serialNumber);
-      if (!isNaN(numA) && !isNaN(numB)) return numA - numB;
-      return String(a.serialNumber).localeCompare(String(b.serialNumber));
+      const ra = parseRoll(a.rollNumber);
+      const rb = parseRoll(b.rollNumber);
+      if (ra.prefix < rb.prefix) return -1;
+      if (ra.prefix > rb.prefix) return 1;
+      if (ra.num !== rb.num) return ra.num - rb.num;
+      return ra.suffix.localeCompare(rb.suffix);
     });
   }, [roster]);
+
 
   const filteredRoster = useMemo(() => {
     const base = sortedRoster;

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { collection, addDoc, doc, getDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, addDoc, doc, getDoc, serverTimestamp, setDoc, Timestamp } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { useAuth } from '../../context/AuthContext';
 import { useTenant } from '../../context/TenantContext';
@@ -775,19 +775,33 @@ const InternalExamWizard = () => {
     const cleanSessionCode = sessionCode.trim().toUpperCase();
     const cleanSubject = subjectName.trim();
     const totalDurationMinutes = (parseInt(durationHours) || 0) * 60 + (parseInt(durationMinutes) || 0);
+    const targetMarks = parseFloat(internalMarks) || 0;
 
     if (!cleanSubject || !cleanSessionCode || !internalMarks || !labNumber || !studentDepartment || !studentSemester || !examDate) {
       alert('Fill all required fields.'); return;
     }
     if (totalDurationMinutes <= 0) { alert("Duration > 0 required."); return; }
-    // STUDENT CAPCUT: check selectedStudents instead of old students array
     if (selectedStudents.length === 0) { alert('Please select at least one student from the roster.'); return; }
     if (questions.length === 0) { alert('Upload question bank.'); return; }
 
-    // Validate total marks
-    const bankTotal = questions.reduce((sum, q) => sum + parseInt(q.marks || 0, 10), 0);
-    if (bankTotal !== parseInt(internalMarks, 10)) {
-      alert(`Questions total marks (${bankTotal}) does not match exam configuration (${internalMarks}).`);
+    // ── Marks validation ──
+    // The question bank is a POOL — it may contain MORE questions than the
+    // exam needs. The system randomly selects a subset that sums to exactly
+    // targetMarks (TIER 1 of the two-tier randomization).
+    //
+    // Rule: the bank total must be >= targetMarks so a subset can be selected.
+    // A subset-sum DP check (validateMCQMarks) confirms a valid combo exists.
+    const bankTotal = questions.reduce((sum, q) => sum + parseFloat(q.marks || 0), 0);
+    if (bankTotal < targetMarks - 0.001) {
+      alert(`❌ The question bank total marks (${bankTotal.toFixed(1)}) is less than the required exam marks (${targetMarks}). Please upload more questions.`);
+      return;
+    }
+
+    // Re-run the subset-sum check to confirm a valid combination exists
+    // (This was already checked at upload time, but we verify again at launch for safety)
+    const isValidCombo = validateMCQMarks(questions, targetMarks);
+    if (!isValidCombo) {
+      alert(`❌ No valid combination of questions sums exactly to ${targetMarks} marks. Please adjust your question bank or the Internal Marks setting.`);
       return;
     }
 
@@ -851,15 +865,23 @@ const InternalExamWizard = () => {
 
       // ── 4. Create student documents with per-student shuffled questions ──
       setLoadingText("Assigning questions to students...");
-      for (const student of students) {
-        const studentId = `${cleanSessionCode}_${student.roll_no}`;
+      for (const student of selectedStudents) {
+        // Roster panel uses camelCase fields: rollNumber / fullName / image
+        const rollNo = student.rollNumber || student.roll_no;
+        const name   = student.fullName   || student.name;
+        if (!rollNo) {
+          console.warn('[InternalExam] Skipping student with undefined roll number:', student);
+          continue;
+        }
+
+        const studentId = `${cleanSessionCode}_${rollNo}`;
 
         // TIER 2: Fisher-Yates shuffle for this specific student
         const shuffledQuestions = shuffleForStudent(baseExamSet);
 
         await setDoc(doc(db, 'colleges', tenantId, 'students', studentId), {
-          roll_no: student.roll_no,
-          name: student.name,
+          roll_no: rollNo,
+          name: name || '',
           image: student.image || "",
           session_code: cleanSessionCode,
           lab_number: labNumber.trim(),
@@ -1277,7 +1299,7 @@ const InternalExamWizard = () => {
                   <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
                     <p><strong>Subject:</strong> {subjectName}</p>
                     <p><strong>Session:</strong> {sessionCode}</p>
-                    <p><strong>Students:</strong> {students.length}</p>
+                    <p><strong>Students:</strong> {selectedStudents.length}</p>
                     <p><strong>Questions in Bank:</strong> {questions.length}</p>
                     <p><strong>Internal Marks:</strong> {internalMarks}</p>
                     <p><strong>Duration:</strong> {(parseInt(durationHours) || 0) * 60 + (parseInt(durationMinutes) || 0)} minutes</p>
@@ -1292,10 +1314,14 @@ const InternalExamWizard = () => {
                 <div className="bg-purple-50 border border-purple-200 rounded-lg p-4 text-sm text-purple-800">
                   <p className="font-bold mb-1">🔀 Question Randomization</p>
                   <p>
-                    {questions.length > parseInt(internalMarks || 0, 10)
-                      ? `From the ${questions.length}-question bank, ${internalMarks} marks worth of questions will be randomly selected to form the Base Exam Set. All students receive the same questions, but in a unique shuffled order.`
-                      : `All ${questions.length} questions will be assigned to every student, each in a unique shuffled order.`
-                    }
+                    {(() => {
+                      const bankTotal = questions.reduce((s, q) => s + parseFloat(q.marks || 0), 0);
+                      const target = parseFloat(internalMarks || 0);
+                      if (bankTotal > target + 0.001) {
+                        return `From the ${questions.length}-question bank (${bankTotal.toFixed(1)} marks total), ${target} marks worth of questions will be randomly selected to form the Base Exam Set. All students receive the same questions, but in a unique shuffled order.`;
+                      }
+                      return `All ${questions.length} questions (${bankTotal.toFixed(1)} marks) will be assigned to every student, each in a unique shuffled order.`;
+                    })()}
                   </p>
                 </div>
 
@@ -1413,7 +1439,7 @@ const InternalExamWizard = () => {
                               {s.image ? (
                                 <img
                                   src={s.image}
-                                  alt={s.name}
+                                  alt={s.fullName || s.name}
                                   className="w-12 h-12 rounded-xl object-cover border-2 border-purple-100 shadow-sm"
                                   onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }}
                                 />
@@ -1422,11 +1448,11 @@ const InternalExamWizard = () => {
                                 className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-100 to-indigo-200 flex items-center justify-center text-purple-600 font-bold text-lg"
                                 style={{ display: s.image ? 'none' : 'flex' }}
                               >
-                                {(s.name || '?')[0].toUpperCase()}
+                                {((s.fullName || s.name) || '?')[0].toUpperCase()}
                               </div>
                             </td>
-                            <td className="px-4 py-3 font-mono font-bold text-gray-800">{s.roll_no}</td>
-                            <td className="px-4 py-3 font-medium text-gray-800">{s.name}</td>
+                            <td className="px-4 py-3 font-mono font-bold text-gray-800">{s.rollNumber || s.roll_no}</td>
+                            <td className="px-4 py-3 font-medium text-gray-800">{s.fullName || s.name}</td>
                             <td className="px-4 py-3">
                               {s.image ? (
                                 <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-100 text-green-700 rounded-full text-xs font-semibold">
@@ -1543,7 +1569,7 @@ const InternalExamWizard = () => {
                 <div className="w-16 h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-4"><span className="text-3xl">🚀</span></div>
                 <h3 className="text-xl font-bold text-gray-800 mb-2">Launch Internal Exam?</h3>
                 <p className="text-sm text-gray-500 mb-4">
-                  {students.length} students will receive {internalMarks} marks worth of MCQ questions in unique shuffled orders.
+                  {selectedStudents.length} students will receive {internalMarks} marks worth of MCQ questions in unique shuffled orders.
                 </p>
                 <div className="flex gap-3 justify-center">
                   <button onClick={() => setShowConfirmModal(false)} className="px-5 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 font-bold">No, Wait</button>

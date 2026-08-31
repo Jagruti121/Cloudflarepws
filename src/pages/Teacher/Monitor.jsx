@@ -61,7 +61,7 @@ const Monitor = () => {
   const [timeRemaining, setTimeRemaining] = useState(null);
   const [isTimeUpModalOpen, setIsTimeUpModalOpen] = useState(false);
   const [hasTimeAlertShown, setHasTimeAlertShown] = useState(false);
-  const [isDownloadingFiles, setIsDownloadingFiles] = useState(false);
+
 
   // --- STATUS FILTER STATE ---
   const [statusFilter, setStatusFilter] = useState(null); // null = show all
@@ -905,59 +905,6 @@ const Monitor = () => {
     } catch (err) {
       alert('Failed to assign slip: ' + err.message);
     }
-  };
-
-  const handleDownloadSessionFiles = async () => {
-    if (!window.confirm("⚠️ Download and DELETE all session files?")) return;
-    setIsDownloadingFiles(true);
-    const zip = new JSZip();
-    const batch = writeBatch(db);
-    const deletePromises = [];
-    let filesFoundCount = 0;
-
-    try {
-      const sessionFolderRef = ref(storage, `exam_uploads/${sessionCode}`);
-      const studentListResult = await listAll(sessionFolderRef);
-      for (const studentFolderRef of studentListResult.prefixes) {
-        const fileListResult = await listAll(studentFolderRef);
-        for (const fileRef of fileListResult.items) {
-          try {
-            filesFoundCount++;
-            const url = await getDownloadURL(fileRef);
-            const response = await fetch(url);
-            if (!response.ok) throw new Error("Fetch failed");
-            const blob = await response.blob();
-            zip.file(fileRef.name, blob);
-            deletePromises.push(deleteObject(fileRef));
-          } catch (err) { console.error(err); }
-        }
-      }
-      if (filesFoundCount === 0) { alert("No files found."); setIsDownloadingFiles(false); return; }
-      const content = await zip.generateAsync({ type: "blob" });
-      saveAs(content, `${sessionCode}_Files.zip`);
-      students.forEach(student => {
-        if (student.answers) {
-          const sRef = doc(db, 'colleges', tenantId, 'students', student.id);
-          const updateData = {};
-          let needsUpdate = false;
-          Object.keys(student.answers).forEach(key => {
-            if (student.answers[key].file_uploaded) {
-              // Mark as downloaded but preserve file_name so teacher can see what was uploaded
-              updateData[`answers.${key}.file_uploaded`] = 'downloaded';
-              updateData[`answers.${key}.file_url`] = deleteField();
-              updateData[`answers.${key}.storage_ref`] = deleteField();
-              // Keep file_name intact for display purposes
-              needsUpdate = true;
-            }
-          });
-          if (needsUpdate) batch.update(sRef, updateData);
-        }
-      });
-      await Promise.all(deletePromises);
-      await batch.commit();
-      alert("Success! Files downloaded and deleted.");
-    } catch (error) { alert("Error: " + error.message); }
-    finally { setIsDownloadingFiles(false); }
   };
 
   // ===================================================

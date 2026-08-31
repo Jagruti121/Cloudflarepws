@@ -161,6 +161,11 @@ const ChangePasswordModal = ({ onClose, currentUser, tenantId, externalLockedUnt
       setOtpAttempts(0);
       setOtpLockedUntil(null);
       setStep(3);
+
+      // Immediately set status to 'verified' so it disappears from the Admin Dashboard
+      await updateDoc(doc(db, 'colleges', tenantId, 'otp_requests', otpDocId), {
+        status: 'verified'
+      });
     } catch (err) {
       setError('Verification failed: ' + err.message);
     } finally {

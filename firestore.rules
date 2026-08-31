@@ -166,9 +166,12 @@ service cloud.firestore {
       allow create: if isAuthenticated()
                     && isOwnTenantTeacher(request.resource.data.tenantId);
 
-      // Teacher can only delete entries belonging to their own tenant
+      // Teacher OR Admin can delete entries belonging to their own tenant
       allow delete: if isAuthenticated()
-                    && isOwnTenantTeacher(resource.data.tenantId);
+                    && (
+                      isOwnTenantTeacher(resource.data.tenantId)
+                      || isOwnTenant(resource.data.tenantId)
+                    );
     }
 
 
