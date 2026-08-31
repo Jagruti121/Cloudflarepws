@@ -66,6 +66,7 @@ const allowedOrigins = [
   'http://localhost:3000',  // CRA / alternate dev server
   'https://nextsolvespms.onrender.com', // Live frontend (solves)
   'https://nextslovespms.onrender.com', // Live frontend (sloves)
+  'https://pws.nextsolves.in',          // Live frontend (Cloudflare Pages)
   process.env.ALLOWED_ORIGIN, // Production origin from .env
 ].filter(Boolean);
 
